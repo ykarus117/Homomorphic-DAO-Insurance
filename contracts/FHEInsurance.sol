@@ -16,7 +16,7 @@ import {ZamaEthereumConfig} from "@fhevm/solidity/config/ZamaConfig.sol";
 
 // TODO: the following code is missing almost all over/under flow checks
 interface votable {
-    function StartVote(address from, euint64 risk, function(bool) external _callback) external;
+    function StartVote(address from, euint64 risk, function(bool, address) external _callback) external;
     function DecryptRisk(euint64 risk) external returns (uint64);
     function CastVote(address to, externalEbool vote, bytes calldata voteProof) external;
     function PublicReveal(address toReveal) external;
@@ -38,7 +38,7 @@ contract Vote is votable, ZamaEthereumConfig {
     mapping(address => request) private requestingUsers;
     mapping(address => euint64) private voters;
 
-    function StartVote(address from, euint64 risk, function(bool) external _callback) external override {
+    function StartVote(address from, euint64 risk, function(bool, address) external _callback) external override {
         require(!requestingUsers[from].exists, DuplicateRequest(from));
         requestingUsers[from] = request({
             _callback: _callback,
@@ -80,7 +80,36 @@ contract Vote is votable, ZamaEthereumConfig {
     function DecryptRisk(euint64 risk) external override returns (uint64) {}
 }
 
-contract Insurance is ZamaEthereumConfig {
+interface insurance {
+    function Init() external;
+    function Evaluation(externalEuint64[] calldata params,
+        bytes[] calldata proofs,
+        externalEbool life,
+        bytes calldata lifeProof) external;
+    function RequestInsurance(externalEuint64[] calldata params,
+        bytes[] calldata proofs,
+        externalEbool life,
+        bytes calldata lifeProof,
+        address beneficiary) external;
+    function ClaimIssue(address dUser) external;
+    function Result(bool result, address to) external;
+    function DepositMonthly(externalEuint64 ex, bytes calldata inputProof) external;
+
+    error UnauthorizedUser(address sender);
+    error DoubleInit(address sender);
+    error IncorrectAmount(address sender);
+    error TooEarlyDeposit(address sender);
+    error DeadlineMissed(address sender);
+    error AmountNotReleased(address sender);
+    error NotEnoughSupply(address sender);
+    error UserNotFound(address sender);
+
+
+    event UserRegistred(address user);
+    event UserEvaluation(address user, bytes32 premium);
+}
+
+contract Insurance is insurance, ZamaEthereumConfig {
     euint64 private _totalSupply;
     string _name;
     string _uri;
@@ -100,24 +129,13 @@ contract Insurance is ZamaEthereumConfig {
         euint64 expectedPremium; // monthly premium
         uint256 lastTimeStamp;
         uint8 missedDeposits;
+        bool isAcccepted;
     }
 
     struct u {
         euint64 wallet;
         bool exists;
     }
-
-    error UnauthorizedUser(address sender);
-    error DoubleInit(address sender);
-    error IncorrectAmount(address sender);
-    error TooEarlyDeposit(address sender);
-    error DeadlineMissed(address sender);
-    error AmountNotReleased(address sender);
-    error NotEnoughSupply(address sender);
-    error UserNotFound(address sender);
-
-    event UserRegistred(address user);
-    event UserEvaluation(address user, bytes32 premium);
 
     mapping(address => User) insuredUsers; // users with an active insurance their amount it unusable and unknown
     mapping(address => u) users; // usable amount
@@ -130,7 +148,7 @@ contract Insurance is ZamaEthereumConfig {
         _owner = msg.sender;
     }
 
-    function Init() external {
+    function Init() external override {
         require(msg.sender == _owner, UnauthorizedUser(msg.sender));
         require(!_isInit, DoubleInit(msg.sender));
         _totalSupply = FHE.asEuint64(100000);
@@ -177,13 +195,15 @@ contract Insurance is ZamaEthereumConfig {
         bytes[] calldata proofs,
         externalEbool life,
         bytes calldata lifeProof
-    ) external {
+    ) external override {
         euint64 evaluation = _evaluation(params, proofs, life, lifeProof);
         FHE.allow(evaluation, msg.sender);
         FHE.allowThis(evaluation);
         emit UserEvaluation(msg.sender, euint64.unwrap(evaluation));
     }
 
+
+    // returns user premium
     function _evaluation(
         externalEuint64[] calldata params,
         bytes[] calldata proofs,
@@ -199,7 +219,27 @@ contract Insurance is ZamaEthereumConfig {
         return _premium(risk, requiredAmount, policyDuration, isLife);
     }
 
-    function RegisterInsuredUser(euint64 premium, euint64 amount, address beneficiary) public {
+    function Result(bool result, address to) external {
+        if (result) {
+            insuredUsers[to].user.isAcccepted = true;
+            emit UserRegistred(to);
+        }
+    }
+
+    function RequestInsurance(externalEuint64[] calldata params,
+        bytes[] calldata proofs,
+        externalEbool life,
+        bytes calldata lifeProof,
+        address beneficiary) external override {
+            euint64 risk = _GLM(params, proofs);
+            euint64 premium = _evaluation(params, proofs, life, lifeProof);
+            euint64 amount = FHE.fromExternal(params[3], proofs[3]);
+            registerInsuredUser(premium, amount, beneficiary);
+            Vote(_vote).StartVote(msg.sender,risk,this.Result);
+        }
+
+    function registerInsuredUser(euint64 premium, euint64 amount, address beneficiary) private {
+        require(msg.sender == _vote);
         // register the insured user
         insuredUsers[msg.sender] = User({
             exists: true,
@@ -208,18 +248,17 @@ contract Insurance is ZamaEthereumConfig {
                 amount: amount,
                 expectedPremium: premium,
                 lastTimeStamp: block.timestamp + 4 weeks,
-                missedDeposits: 0
+                missedDeposits: 0,
+                isAcccepted: false
             })
         });
-
-        emit UserRegistred(msg.sender);
 
         // Create beneficiary account (empty)
         users[beneficiary].wallet = FHE.asEuint64(0);
         users[beneficiary].exists = true;
     }
 
-    function depositMonthly(externalEuint64 ex, bytes calldata inputProof) public {
+    function DepositMonthly(externalEuint64 ex, bytes calldata inputProof) public override {
         // Only registred users can deposit on the token
         User memory currentUser = insuredUsers[msg.sender];
         require(currentUser.exists, UnauthorizedUser(msg.sender));
@@ -248,7 +287,7 @@ contract Insurance is ZamaEthereumConfig {
         currentUser.user.lastTimeStamp = block.timestamp;
     }
 
-    function ClaimIssue(address dUser) public {
+    function ClaimIssue(address dUser) public  override{
         User memory currentUser = insuredUsers[dUser];
 
         // asses users existance
@@ -261,6 +300,8 @@ contract Insurance is ZamaEthereumConfig {
 
         // Allow beneficiary rights to the insured user amount' handle
         FHE.allow(users[msg.sender].wallet, msg.sender);
+        FHE.allowThis(users[msg.sender].wallet);
+
         delete insuredUsers[dUser];
     }
 
